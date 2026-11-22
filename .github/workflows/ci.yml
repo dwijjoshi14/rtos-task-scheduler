@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-test:
+    name: build & test (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ gcc, clang ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: ${{ matrix.compiler }} --version
+      - name: Build (warnings are errors)
+        run: make CC=${{ matrix.compiler }}
+      - name: Unit tests
+        run: make CC=${{ matrix.compiler }} test
+      - name: Smoke run
+        run: ./build/rtos_scheduler --duration 4000 --seed 1 --no-color --csv telemetry.csv --json summary.json
+      - name: Validate telemetry
+        run: |
+          python3 - <<'PY'
+          import json, csv
+          summary = json.load(open("summary.json"))
+          assert summary["schema"] == 1
+          metrics = summary["metrics"]
+          assert metrics["samples"] > 10, metrics
+          assert 0.0 <= metrics["dwell_pct"]["max"] <= 100.0
+          # Mutex discipline is deterministic; deadline overruns are not, because
+          # CI runners are shared machines. Allow a few and fail on systematic
+          # scheduling breakage (the local run reports zero).
+          assert summary["diagnostics"]["mutex_violations"] == 0
+          assert summary["diagnostics"]["deadline_overruns"] <= 10, summary["diagnostics"]
+          rows = list(csv.DictReader(open("telemetry.csv")))
+          assert abs(len(rows) - metrics["samples"]) <= 2, (len(rows), metrics["samples"])
+          assert all(r["fan_state"] in {"OFF", "LOW", "HIGH", "MAX"} for r in rows)
+          print(f"ok: {len(rows)} telemetry rows, max {metrics['temperature_c']['max']:.1f} C")
+          PY
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ asan, tsan ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: ${{ matrix.sanitizer }} build, tests and run
+        run: make ${{ matrix.sanitizer }}
+
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: GCC analyzer
+        run: make analyze
+
+  fault-injection:
+    name: fault handling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - name: Stuck sensor is detected and the fan fails safe
+        run: |
+          ./build/rtos_scheduler --duration 5000 --stuck-at 10 --no-color --csv stuck.csv > stuck.log
+          grep -q "sensor fault: STUCK" stuck.log
+          grep -q "holding fan" stuck.log
+          grep -q "STUCK" stuck.csv
+          echo "fail-safe path exercised"
+      - name: Watchdog notices a sensor that stops publishing
+        run: |
+          ./build/rtos_scheduler --duration 4000 --stall-at 8 --watchdog 600 --no-color > watchdog.log
+          grep -q "sensor fault: TIMEOUT" watchdog.log
+          grep -q "fail-safe" watchdog.log
+          echo "watchdog path exercised"
