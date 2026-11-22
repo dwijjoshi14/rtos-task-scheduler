@@ -1,65 +1,81 @@
 #pragma once
 /*
- * Shared data types passed between tasks via queues.
+ * Shared data types and the runtime handshake between tasks.
  *
- * System architecture:
+ *   SensorTask (P3) ──[xSensorQueue]──► ControlTask (P4) ──[xDisplayQueue]──► DisplayTask (P2)
+ *                                             │
+ *                                             └──[xAlertSemaphore]────────► DisplayTask (P2)
  *
- *   SensorTask  ──[SensorQueue]──►  ControlTask  ──[DisplayQueue]──►  DisplayTask
- *                                        │
- *                                        └──[AlertSemaphore]──────────►  DisplayTask
+ *   ControlTask ──[g_fan_duty_pct]──► SensorTask   (fan duty closes the thermal loop)
  *
- * SensorTask   : Generates temperature readings every 500 ms
- * ControlTask  : Reads readings, decides fan state, signals alert if critical
- * DisplayTask  : Formats and prints all status output; handles critical alerts
+ * All tasks share xConsoleMutex to keep console output from interleaving, and
+ * observe g_sim_stop / g_sigint so Ctrl+C ends the run cleanly with a report.
  */
 
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
-/* Fan operating states — mirrors what PWM levels would be on hardware */
+#include "FreeRTOS.h"
+
+/* ── Fan operating states ──────────────────────────────────── */
 typedef enum {
-    FAN_OFF    = 0,   /* T <= 30 C  */
-    FAN_LOW    = 1,   /* 30 < T <= 50 C */
-    FAN_HIGH   = 2,   /* 50 < T <= 75 C */
-    FAN_MAX    = 3,   /* T > 75 C  — critical */
+    FAN_OFF  = 0,   /* T <= low threshold            */
+    FAN_LOW  = 1,
+    FAN_HIGH = 2,
+    FAN_MAX  = 3,   /* T > critical threshold        */
+    FAN_STATE_COUNT = 4,
 } FanState_t;
 
-/* Packet sent from SensorTask → ControlTask via xSensorQueue */
+/* ── Sensor health ─────────────────────────────────────────── */
+typedef enum {
+    SENSOR_OK = 0,
+    SENSOR_STUCK,        /* value did not move between samples   */
+    SENSOR_OUT_OF_RANGE, /* implausible reading                  */
+    SENSOR_TIMEOUT,      /* no reading arrived inside the window */
+} SensorFault_t;
+
+/* SensorTask → ControlTask packet */
 typedef struct {
-    float    temperature_c;
-    uint32_t tick_ms;
+    float    raw_c;          /* unfiltered plant output     */
+    float    temperature_c;  /* EMA-filtered value          */
+    uint32_t tick_ms;        /* sample timestamp (ticks)    */
+    uint32_t sequence;       /* monotonic sample counter    */
 } SensorReading_t;
 
-/* Packet sent from ControlTask → DisplayTask via xDisplayQueue */
+/* ControlTask → DisplayTask packet */
 typedef struct {
-    float      temperature_c;
-    FanState_t fan_state;
-    uint32_t   tick_ms;
-    uint8_t    is_critical;   /* set when T > 75 C */
+    float       temperature_c;  /* filtered value driving the decision */
+    float       raw_c;
+    FanState_t  fan_state;
+    uint8_t     duty_pct;
+    uint8_t     is_critical;
+    SensorFault_t fault;        /* SENSOR_OK for a normal sample */
+    uint32_t    tick_ms;
+    uint32_t    sequence;
 } DisplayMsg_t;
 
-/* Temperature thresholds (degrees C) */
-#define TEMP_LOW_THRESHOLD       30.0f
-#define TEMP_HIGH_THRESHOLD      50.0f
-#define TEMP_CRITICAL_THRESHOLD  75.0f
-
-/* Queue depths */
+/* ── Queue depths ──────────────────────────────────────────── */
 #define SENSOR_QUEUE_DEPTH   8
 #define DISPLAY_QUEUE_DEPTH  8
 
-/* Task periods (ms) */
-#define SENSOR_PERIOD_MS   500
-#define CONTROL_PERIOD_MS  50     /* ControlTask polls queue; fast response */
-#define DISPLAY_PERIOD_MS  100
-
-/* Task stack sizes (words — unused in simulation but kept for STM32 portability) */
+/* ── Stack sizes (words; unused by the simulation, needed on target) ── */
 #define SENSOR_STACK_SIZE   256
 #define CONTROL_STACK_SIZE  256
 #define DISPLAY_STACK_SIZE  256
 
-/* Task priorities */
-#define SENSOR_PRIORITY    3
-#define CONTROL_PRIORITY   4      /* highest — must respond to temp changes fast */
-#define DISPLAY_PRIORITY   2
+/* ── Task priorities ───────────────────────────────────────── */
+#define SENSOR_PRIORITY     3
+#define CONTROL_PRIORITY    4   /* highest: the control loop must never lag */
+#define DISPLAY_PRIORITY    2
 
-/* Global stop flag — DisplayTask sets this to 1 to end simulation cleanly */
-extern volatile int g_sim_stop;
+/* ── Run control ───────────────────────────────────────────── */
+extern atomic_int         g_sim_stop;     /* any task may end the run        */
+extern volatile sig_atomic_t g_sigint;    /* set from the SIGINT handler     */
+extern atomic_int         g_fan_duty_pct; /* ControlTask → SensorTask        */
+extern _Atomic(uint32_t)  g_sim_start_ms; /* tick at the first task launch   */
+
+int  sim_should_stop(void);
+void sim_request_stop(void);
+uint32_t sim_elapsed_ms(void);
+int  sim_deadline_reached(uint32_t duration_ms);
