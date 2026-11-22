@@ -1,4 +1,20 @@
+# build artefacts
+build/
 rtos_scheduler
 *.o
+*.d
 *.out
+
+# run artefacts
+telemetry.csv
+summary.json
+artifacts/
+
+# editors / OS
 .DS_Store
+*.swp
+.vscode/
+.idea/
+
+# python caches from tooling
+__pycache__/
